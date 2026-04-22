@@ -1,0 +1,13 @@
+intervaltree>=3.1.0
+matplotlib>=3.5.0
+numpy>=1.21.0
+pillow>=9.0.0
+pygame>=2.5.0
+pytest>=7.0.0
+streamlit>=1.33.0
+plotly>=5.0.0
+pandas>=1.5.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+fpdf2>=2.7.9
+kaleido>=0.2.1
