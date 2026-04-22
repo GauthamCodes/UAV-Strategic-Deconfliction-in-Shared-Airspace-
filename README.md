@@ -1,258 +1,356 @@
-# UAV Deconfliction System
+# UAV Strategic Deconfliction in Shared Airspace
 
 **Is my drone mission safe to fly right now?**
 
-This system answers that question in under 1 millisecond, with mathematical certainty. No guessing. No sampling. Exact math.
-
-A high-performance, mathematically rigorous collision detection system for unmanned aerial vehicles (UAVs) operating with continuous trajectories.
-
-## What This Does (Plain English)
-
-Before a drone takes off, it needs to know whether its planned route will bring it too close to any other drone already in the air. This system checks that by modelling every drone's exact position at every moment in time, and mathematically computing whether any two drones will ever be within the safety distance of each other.
-
-**No guessing. No sampling. Exact math.**
-
-## Overview
-
-This system answers a critical mission-planning question: **Can two or more UAVs operate simultaneously without violating safety constraints?**
-
-Given:
-- **N drones** with constant velocity segments and known departure times  
-- A **spatial safety buffer** (default: 5m)
-
-The system returns:
-- ✅ **`"clear"`** — mission is safe to execute  
-- ❌ **`"conflict detected"`** — with detailed reports (when, where, which drones)
-
-### Key Features
-
-- **Exact analytical collision detection** using Closest Point of Approach (CPA) mathematics
-- **4D awareness** (x, y, z, time) for altitude-aware deconfliction  
-- **Efficient broad-phase pruning** via 4D AABB to reduce O(N·M) to near-linear in practice  
-- **Continuous trajectory analysis** — no discrete time-stepping approximation  
-- **Comprehensive edge case handling** — degenerate geometries, parallel paths, zero-crossing moments
-- **Visualization suite** — 2D plots with safety circles, 4D space-time diagrams, animations
-
-## Project Structure
-
-```
-.
-├── core/
-│   ├── models.py           # Data classes (Waypoint, DroneMission, ConflictEvent, ConflictReport)
-│   ├── geometry.py         # Exact CPA math + buffer crossing time derivations (α, β, γ)
-│   └── deconfliction.py    # Two-phase engine (broad-phase AABB + narrow-phase exact CPA)
-├── data/
-│   ├── scenarios.py        # 8 pre-built scenarios (clear, conflict, spec sample, multi-drone)
-│   └── loader.py           # JSON scenario loader for custom cases
-├── visualization/
-│   ├── viz_2d.py           # Matplotlib 2D plots + animations (GIF export)
-│   └── viz_3d.py           # 3D static plots + space-time tube (4D visualization)
-├── main.py                 # CLI entry point
-├── demo.py                 # Batch runner for all scenarios
-├── test_deconfliction.py   # 19 comprehensive unit tests (all passing)
-└── requirements.txt
-```
-
-## Installation
-
-### Prerequisites
-- Python 3.8+
-
-### Setup
-
-```bash
-# Clone or download the project
-cd Flytbase\ project
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run all tests to verify setup
-pytest test_deconfliction.py -v
-```
-
-Expected output: **19 passed in ~0.3s**
-
-## Usage
-
-### Command-line Interface
-
-```bash
-# Run with default scenario (perpendicular collision)
-python main.py
-
-# Run a specific built-in scenario
-python main.py --scenario clear_parallel
-
-# Load from a custom JSON scenario file
-python main.py --file my_scenario.json
-
-# Show interactive visualization (Matplotlib window)
-python main.py --scenario perpendicular_collision --visualize
-
-# Save 2D animation as GIF
-python main.py --scenario clear_parallel --save-2d anim_2d.gif
-
-# Save 4D space-time visualization as PNG
-python main.py --scenario perpendicular_collision --save-4d spacetime.png
-```
-
-### Programmatic API
-
-```python
-from core.models import Waypoint, DroneMission
-from core.deconfliction import check_mission
-
-# Define primary drone's mission
-primary = DroneMission(
-    drone_id="PRIMARY",
-    waypoints=[Waypoint(0, 0, 50), Waypoint(100, 0, 50)],
-    speed=10.0,
-    departure_time=0.0,
-    mission_end_time=15.0
-)
-
-# Define other drones to check against
-others = [
-    DroneMission(
-        drone_id="DRONE-1",
-        waypoints=[Waypoint(50, 0, 50), Waypoint(50, 100, 50)],
-        speed=10.0,
-        departure_time=0.0
-    )
-]
-
-# Run deconfliction check
-report = check_mission(primary, others, safety_buffer=5.0)
-
-# Interpret results
-if report.status == "clear":
-    print("Mission is safe!")
-else:
-    for conflict in report.conflicts:
-        print(f"Conflict: {conflict.explain()}")
-        print(f"  Buffer breach: {conflict.overlap_start:.2f}s - {conflict.overlap_end:.2f}s")
-        print(f"  Minimum separation: {conflict.distance:.2f}m")
-```
-
-## Demo & Visualization
-
-Run all built-in scenarios and generate visualizations:
-
-```bash
-python demo.py
-```
-
-This generates 16 output files in `demo_output/` (2 per scenario):
-- **2D snapshots** (PNG): top-down view with safety buffer circles
-- **Space-time diagrams** (PNG): 4D visualization (x, y, time) showing drone trajectories
-- **Animations** (GIF): 2D trajectories with time progression
-
-### Built-in Scenarios
-
-1. **`clear_parallel`** — Two drones on parallel lanes 20m apart (CLEAR)
-2. **`different_speeds_safe`** — Crossing paths, different speeds (CLEAR)
-3. **`same_path_safe_gap`** — Same path with 50m temporal gap (CLEAR)
-4. **`altitude_separation_4d`** — 3D altitude separation (CLEAR)
-5. **`perpendicular_collision`** — Head-on crossing collision (CONFLICT at t=5.0s)
-6. **`tailgating_unsafe`** — Following too closely on same path (CONFLICT at default 5m buffer)
-7. **`spec_v11_sample`** — The spec's own sample test: crossing paths, different speeds (CLEAR)
-8. **`multi_drone_busy`** — 4 drones in complex airspace (CLEAR with broad-phase pruning)
-
-## Algorithm
-
-### Two-Phase Collision Detection
-
-#### Phase 1: Broad-Phase (4D AABB Pruning)
-- Compute bounding boxes in 4D space (x, y, z, time)
-- Only segment pairs with overlapping boxes advance to narrow-phase
-- **Typical reduction**: 11–12 segment pairs → 1–2 for exact checking
-
-#### Phase 2: Narrow-Phase (Exact CPA)
-For each candidate pair:
-1. Solve for closest approach time analytically using quadratic formula
-2. Compute minimum separation distance at that time
-3. Check if separation < safety buffer AND time overlaps with both missions
-4. Deduplicate conflicts at segment joints
-
-### Closest Point of Approach (CPA)
-
-For two drones with position vectors **p₁**(t) and **p₂**(t), the squared distance is:
-
-```
-D²(t) = |p₁(t) - p₂(t)|² = α·t² + β·t + γ
-```
-
-The minimum occurs at:
-- **t_cpa = -β / (2α)** (if α ≠ 0)
-- Special handling for parallel/degenerate cases
-
-**Minimum separation**:
-```
-S_min = √(γ - β²/(4α))
-```
-
-**Buffer crossing times** (when separation enters/exits buffer zone):
-- Solve: D²(t) = buffer² to get t₁, t₂
-- Check temporal overlap with mission time windows
-
-See `core/geometry.py` for full derivations and numerical stability handling.
-
-## Testing
-
-### Run All Tests
-```bash
-pytest test_deconfliction.py -v
-```
-
-### Test Coverage
-
-- **Clear scenarios** (3 tests): Parallel paths, safe temporal gaps, altitude separation
-- **Conflict scenarios** (2 tests): Perpendicular collision, tailgating
-- **Edge cases** (6 tests): No time overlap, degenerate geometries, infeasible windows, deduplication
-- **4D extra credit** (3 tests): Altitude-aware collision detection
-- **Scalability** (1 test): 50-drone scenario with broad-phase pruning
-- **Geometry** (4 tests): CPA math, buffer crossing times
-
-### Performance
-
-- **Single scenario**: < 50ms (including visualization)
-- **All 7 scenarios** (with PNG/GIF export): < 60 seconds
-- **Broad-phase pruning**: Reduces segment checks by ~90% in multi-drone cases
-
-## Limitations & Future Work
-
-### Current Limitations
-- Constant velocity between waypoints (no acceleration/deceleration)
-- Single safety buffer value (no per-drone or per-altitude buffers)
-- 2D analysis with 3D altitude (not true 3D movement planning)
-
-### Scalability for 10,000+ Drones
-For production deployment at scale:
-
-1. **Spatial indexing**: Replace 4D AABB with R-tree or KD-tree
-2. **Time-windowing**: Break airspace into time slices, process independently
-3. **Distributed computing**: Partition drone set across cluster (e.g., Kafka + Spark)
-4. **GPU acceleration**: CPA math is vectorizable (NumPy/CuPy)
-
-See `reflection.md` for detailed scalability discussion.
-
-## Files Generated
-
-| File | Purpose |
-|------|---------|
-| `demo_output/*_2d.png` | 2D trajectory snapshot with safety circles |
-| `demo_output/*_spacetime.png` | 4D space-time visualization |
-| `demo_output/*_anim.gif` | Animated 2D trajectory (15 FPS) |
-
-## References
-
-- **Assignment spec (v1.1)**: Continuous trajectory analysis, 4D extra credit, CLI + visualization
-- **CPA mathematics**: Derived from analytic geometry and quadratic root-finding
-- **Broad-phase pruning**: Inspired by R-tree spatial indexing (simplified 4D AABB variant)
+This project answers that in continuous time using exact math (not time-step simulation), then exposes the result through:
+1. a **Streamlit dashboard** for non-technical users,
+2. a **FastAPI REST API** for integration,
+3. a **CLI** for quick technical workflows.
 
 ---
 
-**Assignment**: UAV Deconfliction System  
-**Status**: ✅ Complete and tested  
-**Last updated**: 2026-04-21
+## Why this project exists
+
+Before takeoff, operators need to know if planned trajectories will violate minimum separation in shared airspace.  
+This system checks mission overlap in **x, y, z, and time** and returns:
+
+- **clear** (safe to execute), or
+- **conflict detected** with exact details: who, when, where, how close, and for how long.
+
+No sampling. No skipped events between time steps. Exact CPA-based detection.
+
+---
+
+## What is included
+
+### 1. Streamlit dashboard (primary human interface)
+
+Run:
+
+```bash
+streamlit run dashboard.py
+```
+
+Open:
+
+```text
+http://localhost:8501
+```
+
+### Dashboard capabilities
+
+| Capability | What it gives you |
+|---|---|
+| Scenario explorer | One-click built-in mission sets (safe, conflict, busy airspace) |
+| Upload JSON | Validate your own mission data directly |
+| Plain-English status | Clear / conflict summaries for non-technical users |
+| Time scrubber | Inspect live drone positions at any timestamp |
+| Mission replay | Animated playback with speed control and conflict cueing |
+| Advanced analytics | Separation-vs-time and 3D airspace view |
+| Conflict cards | Human-readable explanation + exact conflict windows |
+| Resolver suggestion | Minimum departure delay to clear conflicts |
+| Builder mode | Create custom routes and test against preset traffic |
+| Export tools | TXT report, PDF report, PNG map snapshot, scenario JSON |
+| Session history | Reload recent analyses quickly |
+
+### Recent Streamlit performance + UX upgrades
+
+- Cached tone generation for faster audio playback (`@lru_cache`).
+- Non-blocking audio cues (removed blocking sleep in `_play_sound`).
+- Replay now triggers audio on **exact conflict-time crossing**.
+- Replay frame cap + adaptive step size for smooth rendering on low-power machines.
+- Performance profiles:
+  - **Fast (Recommended)**: quickest feedback,
+  - **Balanced**,
+  - **High Detail**.
+- Optional 3D panel toggle to reduce heavy rendering when needed.
+- Time-series chart sample count now profile-driven.
+- Resolver now runs only for real conflicts (not near-miss-only outputs).
+- Export work moved behind an expander; heavy PNG generation is opt-in.
+- One-click **Reset current analysis** for simpler usage.
+
+---
+
+## 2. FastAPI REST API (integration interface)
+
+Run:
+
+```bash
+python -m uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+Open Swagger docs:
+
+```text
+http://localhost:8000/docs
+```
+
+### API endpoints
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/` | Redirects to `/docs` |
+| GET | `/health` | Service liveness probe |
+| POST | `/deconflict` | Core safety check (primary vs others) |
+| POST | `/resolve` | Find minimum departure offset to clear conflicts |
+
+### `/deconflict` capabilities
+
+- Continuous-time analytical collision detection.
+- Optional near-miss reporting (`include_near_misses`).
+- Returns:
+  - `status` (`clear` or `conflict_detected`)
+  - conflict count,
+  - exact conflict details (time, location, distance),
+  - exact breach window (`t_entry_s`, `t_exit_s`, `duration_s`),
+  - broad-phase metrics (`temporal_candidates_checked`, `broad_phase_prunes`).
+
+Example request:
+
+```json
+{
+  "primary": {
+    "drone_id": "PRIMARY",
+    "waypoints": [{"x": 0, "y": 50, "z": 30}, {"x": 100, "y": 50, "z": 30}],
+    "speed": 10.0,
+    "departure_time": 0.0,
+    "mission_end_time": 15.0
+  },
+  "others": [
+    {
+      "drone_id": "DRONE-1",
+      "waypoints": [{"x": 50, "y": 0, "z": 30}, {"x": 50, "y": 100, "z": 30}],
+      "speed": 10.0,
+      "departure_time": 0.0
+    }
+  ],
+  "safety_buffer": 5.0,
+  "include_near_misses": false
+}
+```
+
+Example response (trimmed):
+
+```json
+{
+  "status": "conflict_detected",
+  "conflict_count": 1,
+  "safety_buffer_m": 5.0,
+  "temporal_candidates_checked": 1,
+  "broad_phase_prunes": 0,
+  "conflicts": [
+    {
+      "other_drone": "DRONE-1",
+      "severity": "collision",
+      "time_s": 5.0,
+      "distance_m": 0.0,
+      "location": {"x": 50.0, "y": 50.0, "z": 30.0},
+      "breach_window": {
+        "t_entry_s": 4.5,
+        "t_exit_s": 5.5,
+        "duration_s": 1.0
+      }
+    }
+  ]
+}
+```
+
+### `/resolve` capabilities
+
+- Searches departure offsets and returns the **minimum safe delay**.
+- Useful when `/deconflict` reports conflicts and you need an actionable fix.
+
+Example request:
+
+```json
+{
+  "primary": { "...": "same mission shape as /deconflict" },
+  "others": [ { "...": "traffic missions" } ],
+  "safety_buffer": 5.0,
+  "max_delay_seconds": 300.0,
+  "step_seconds": 0.25
+}
+```
+
+Example response:
+
+```json
+{
+  "resolved": true,
+  "offset_s": 7.5,
+  "new_departure_s": 7.5,
+  "checks_performed": 31,
+  "reason": null
+}
+```
+
+---
+
+## 3. CLI (technical / scripting interface)
+
+Run a built-in scenario:
+
+```bash
+python main.py --scenario perpendicular_collision
+```
+
+Useful CLI options:
+
+```bash
+python main.py --help
+python main.py --scenario clear_parallel --include-near-misses
+python main.py --scenario multi_drone_busy --resolve
+python main.py --file my_scenario.json --buffer 8.0
+```
+
+---
+
+## Quick start (recommended order)
+
+### Step 1: Install
+
+```bash
+pip install -r requirements.txt
+```
+
+### Step 2: Verify tests
+
+```bash
+pytest -q
+```
+
+Expected baseline:
+
+```text
+30 passed
+```
+
+### Step 3: Launch your preferred interface
+
+- Dashboard: `streamlit run dashboard.py`
+- API: `python -m uvicorn api:app --host 0.0.0.0 --port 8000`
+- CLI: `python main.py --scenario multi_drone_busy`
+
+---
+
+## Docker run
+
+Start dashboard + API together:
+
+```bash
+docker-compose up --build
+```
+
+Then open:
+
+- Dashboard: `http://localhost:8501`
+- API docs: `http://localhost:8000/docs`
+
+---
+
+## Built-in scenarios
+
+1. `clear_parallel` - two drones on parallel safe lanes  
+2. `different_speeds_safe` - crossing geometry, safe timing  
+3. `same_path_safe_gap` - same route, sufficient temporal separation  
+4. `altitude_separation_4d` - 2D crossing but safe altitude split  
+5. `perpendicular_collision` - exact crossing-time collision  
+6. `tailgating_unsafe` - same path, unsafe following gap  
+7. `spec_v11_sample` - assignment sample scenario  
+8. `multi_drone_busy` - denser mixed traffic case
+
+---
+
+## Project structure
+
+```text
+.
+├── core/
+│   ├── models.py
+│   ├── geometry.py
+│   ├── deconfliction.py
+│   └── resolver.py
+├── data/
+│   ├── scenarios.py
+│   └── loader.py
+├── visualization/
+│   ├── viz_2d.py
+│   ├── viz_3d.py
+│   └── viz_3d_interactive.py
+├── dashboard.py            # Streamlit UI
+├── api.py                  # FastAPI service
+├── main.py                 # CLI entry point
+├── demo.py                 # Batch scenario runner
+├── test_deconfliction.py   # Test suite
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
+```
+
+---
+
+## Algorithm summary
+
+Three-stage pipeline in `core/deconfliction.py`:
+
+1. **Temporal pre-filtering** with interval overlap.
+2. **Spatial broad-phase** with 4D AABB pruning.
+3. **Exact narrow-phase** with closed-form CPA and breach window math.
+
+This keeps detection exact while scaling better than naive segment pair scans.
+
+---
+
+## Performance notes
+
+- Core analytical checks are fast for assignment-scale scenarios.
+- Broad-phase pruning avoids unnecessary narrow-phase computations.
+- Dashboard includes runtime controls to keep UI responsive:
+  - replay frame cap,
+  - optional 3D panel,
+  - adaptive replay stepping,
+  - configurable detail profiles.
+
+---
+
+## Quality status
+
+- Test suite passing (`pytest -q`).
+- API documented via Swagger/OpenAPI.
+- Dashboard supports both non-technical and advanced technical workflows.
+- Exports and resolver workflow integrated for assignment demonstration.
+
+---
+
+## Troubleshooting
+
+### Streamlit audio does not play
+
+- Ensure browser tab is not muted.
+- Enable **Audio cues** in sidebar.
+- Try Chrome/Edge if browser blocks autoplay.
+
+### PNG/PDF export fails
+
+- Install Kaleido (already in `requirements.txt`):
+
+```bash
+pip install kaleido
+```
+
+### API not reachable
+
+- Confirm Uvicorn is running on port `8000`.
+- Open `http://localhost:8000/health` first, then `http://localhost:8000/docs`.
+
+---
+
+## Submission note
+
+This repo is structured to satisfy assignment needs:
+- exact continuous-time deconfliction,
+- explainable conflict output,
+- human-friendly dashboard,
+- developer-friendly API and CLI,
+- test-backed implementation.
+

@@ -13,6 +13,7 @@ import tempfile
 import time
 import wave
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,7 @@ OTHER_COLORS = ["#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e74c3c", "#3498db"
 PRIMARY_COLOR = "#1f77b4"
 CONFLICT_COLOR = "#f85149"
 NEARMISS_COLOR = "#e3b341"
+REAL_CONFLICT_SEVERITIES = {"collision", "buffer_breach"}
 
 
 st.set_page_config(
@@ -144,6 +146,7 @@ def _style_waypoint_preview(df: pd.DataFrame, invalid_mask: pd.DataFrame) -> pd.
     return styler.apply(_apply_row, axis=1)
 
 
+@lru_cache(maxsize=16)
 def _tone_wav_bytes(freq: float, duration_s: float, volume: float = 0.3) -> bytes:
     sample_rate = 22050
     n_samples = int(sample_rate * duration_s)
@@ -162,12 +165,13 @@ def _tone_wav_bytes(freq: float, duration_s: float, volume: float = 0.3) -> byte
 
 
 def _play_sound(sound_type: str) -> None:
+    """Play a short sound cue without blocking the UI thread."""
     if sound_type == "clear":
-        st.audio(_tone_wav_bytes(880.0, 0.13), format="audio/wav", autoplay=True)
+        st.audio(_tone_wav_bytes(880.0, 0.2), format="audio/wav", autoplay=True)
     elif sound_type == "warning":
-        st.audio(_tone_wav_bytes(660.0, 0.16), format="audio/wav", autoplay=True)
+        st.audio(_tone_wav_bytes(660.0, 0.25), format="audio/wav", autoplay=True)
     elif sound_type == "conflict":
-        st.audio(_tone_wav_bytes(330.0, 0.22), format="audio/wav", autoplay=True)
+        st.audio(_tone_wav_bytes(330.0, 0.35), format="audio/wav", autoplay=True)
 
 
 def _save_to_history(primary: DroneMission, others: list[DroneMission], report, buffer_val: float) -> None:
@@ -391,24 +395,61 @@ def _build_plotly_map(
     return fig
 
 
-def _is_conflict_live(report, t_value: float) -> bool:
-    """Return True if any real conflict is active at the provided time."""
-    for conflict in report.conflicts:
-        if conflict.severity not in ("collision", "buffer_breach"):
-            continue
-        if conflict.t_entry is not None and conflict.t_exit is not None:
-            if conflict.t_entry <= t_value <= conflict.t_exit:
-                return True
-        elif abs(conflict.time_of_conflict - t_value) <= 0.1:
-            # Fallback for events without an explicit breach window.
-            return True
-    return False
+def _should_trigger_conflict_audio(
+    conflict_times: list[float],
+    previous_t: float,
+    current_t: float,
+    next_index: int,
+) -> tuple[bool, int]:
+    """
+    Trigger audio when replay time crosses an exact CPA conflict time.
+
+    Returns (triggered, new_index), where new_index consumes all conflict times
+    <= current_t to avoid repeated beeps for the same event.
+    """
+    triggered = False
+    idx = next_index
+    while idx < len(conflict_times) and conflict_times[idx] <= current_t + 1e-9:
+        if conflict_times[idx] >= previous_t - 1e-9:
+            triggered = True
+        idx += 1
+    return triggered, idx
 
 
-def _build_time_series(primary: DroneMission, others: list[DroneMission], safety_buffer: float) -> go.Figure:
+def _build_replay_timeline(
+    t_start: float,
+    t_end: float,
+    requested_step: float,
+    max_frames: int,
+) -> tuple[list[float], float]:
+    """
+    Build a replay timeline that caps frame count for smoother UI rendering.
+    Returns (timeline, effective_step).
+    """
+    duration = max(t_end - t_start, 0.0)
+    if duration <= 1e-9:
+        return [float(t_start)], requested_step
+
+    min_step_for_cap = duration / max(max_frames - 1, 1)
+    effective_step = max(requested_step, min_step_for_cap)
+    frame_count = int(math.floor(duration / effective_step))
+    timeline = [round(t_start + (i * effective_step), 6) for i in range(frame_count + 1)]
+    if timeline[-1] < t_end - 1e-9:
+        timeline.append(round(t_end, 6))
+    return timeline, effective_step
+
+
+def _build_time_series(
+    primary: DroneMission,
+    others: list[DroneMission],
+    safety_buffer: float,
+    sample_points: int = 300,
+) -> go.Figure:
     t_start = min([primary.departure_time] + [d.departure_time for d in others])
     t_end = max([primary.arrival_time] + [d.arrival_time for d in others])
-    times = [t_start + ((t_end - t_start) * i / 299) for i in range(300)]
+    sample_count = max(80, int(sample_points))
+    denom = max(sample_count - 1, 1)
+    times = [t_start + ((t_end - t_start) * i / denom) for i in range(sample_count)]
 
     fig = go.Figure()
     for i, drone in enumerate(others):
@@ -625,15 +666,26 @@ def _run_resolver_with_progress(primary: DroneMission, others: list[DroneMission
     return result
 
 
-def _run_check(primary: DroneMission, others: list[DroneMission], buffer_val: float) -> tuple:
+def _run_check(
+    primary: DroneMission,
+    others: list[DroneMission],
+    buffer_val: float,
+    include_near_misses: bool = False,
+) -> tuple:
     t0 = time.perf_counter()
     with st.spinner(f"Analyzing {len(others) + 1} drone trajectories..."):
-        report = check_mission(primary, others, buffer_val)
+        report = check_mission(
+            primary,
+            others,
+            buffer_val,
+            include_near_misses=include_near_misses,
+        )
     elapsed_ms = (time.perf_counter() - t0) * 1000
     st.session_state["analysis_ms"] = elapsed_ms
 
     resolver_result = None
-    if report.conflicts:
+    has_real_conflicts = any(c.severity in REAL_CONFLICT_SEVERITIES for c in report.conflicts)
+    if has_real_conflicts:
         with st.spinner("Finding minimum departure delay..."):
             resolver_result = _run_resolver_with_progress(primary, others, buffer_val)
 
@@ -709,8 +761,35 @@ with st.sidebar:
         help="Basic hides technical details. Advanced reveals raw conflict data and analytics.",
     )
     enable_audio = st.toggle("Audio cues", value=False, help="Play short cues after checks.")
+    include_near_misses = st.toggle(
+        "Show near-miss warnings",
+        value=(mode == "Advanced"),
+        help="Warn about close calls that are outside the strict conflict threshold.",
+    )
+    perf_profile = st.select_slider(
+        "Performance profile",
+        options=["Fast (Recommended)", "Balanced", "High Detail"],
+        value="Fast (Recommended)" if mode == "Basic" else "Balanced",
+        help="Choose faster rendering or higher chart detail.",
+    )
+    profile_cfg = {
+        "Fast (Recommended)": {"replay_max_frames": 240, "time_series_samples": 160, "show_3d_default": False},
+        "Balanced": {"replay_max_frames": 360, "time_series_samples": 300, "show_3d_default": True},
+        "High Detail": {"replay_max_frames": 600, "time_series_samples": 500, "show_3d_default": True},
+    }
+    replay_max_frames = int(profile_cfg[perf_profile]["replay_max_frames"])
+    time_series_samples = int(profile_cfg[perf_profile]["time_series_samples"])
+    show_3d_default = bool(profile_cfg[perf_profile]["show_3d_default"])
+    st.caption(f"Replay frame cap: {replay_max_frames} | Time-series points: {time_series_samples}")
+
     if enable_audio and st.button("Test conflict sound", use_container_width=True):
         _play_sound("conflict")
+    if st.button("Reset current analysis", use_container_width=True):
+        st.session_state["result"] = None
+        st.session_state["analysis_ms"] = None
+        st.session_state["pending_sound"] = None
+        st.session_state["conflict_filter"] = "All"
+        st.rerun()
 
     st.markdown("---")
     source = st.radio("Data Source", ["Preset Scenario", "Upload JSON"])
@@ -735,10 +814,15 @@ with st.sidebar:
                 "Typical: 5 m for small UAVs, larger for cargo/urban missions."
             ),
         )
-        if st.button("Run Deconfliction Check", use_container_width=True):
+        if st.button("Check Mission Safety", use_container_width=True):
             try:
                 primary, others = SCENARIOS[scenario_key]()
-                st.session_state["result"] = _run_check(primary, others, buffer_val)
+                st.session_state["result"] = _run_check(
+                    primary,
+                    others,
+                    buffer_val,
+                    include_near_misses=include_near_misses,
+                )
                 report = st.session_state["result"][2]
                 st.session_state["pending_sound"] = "clear" if report.is_clear() else "conflict"
                 st.rerun()
@@ -784,11 +868,16 @@ with st.sidebar:
             0.5,
             help="Fallback buffer if JSON does not include safety_buffer.",
         )
-        if uploaded and st.button("Run Deconfliction Check", use_container_width=True):
+        if uploaded and st.button("Check Mission Safety", use_container_width=True):
             try:
                 primary, others, parsed_buffer = _parse_uploaded_json(uploaded.read())
                 effective_buffer = parsed_buffer if parsed_buffer > 0 else upload_buffer
-                st.session_state["result"] = _run_check(primary, others, effective_buffer)
+                st.session_state["result"] = _run_check(
+                    primary,
+                    others,
+                    effective_buffer,
+                    include_near_misses=include_near_misses,
+                )
                 report = st.session_state["result"][2]
                 st.session_state["pending_sound"] = "clear" if report.is_clear() else "conflict"
                 st.rerun()
@@ -820,7 +909,12 @@ with st.sidebar:
                 label = f"{data['primary']['drone_id']} - {status}"
                 if st.button(label, key=f"hist_{hist_file.name}", use_container_width=True):
                     p, o, b = _load_history(hist_file)
-                    st.session_state["result"] = _run_check(p, o, b)
+                    st.session_state["result"] = _run_check(
+                        p,
+                        o,
+                        b,
+                        include_near_misses=include_near_misses,
+                    )
                     st.session_state["pending_sound"] = "clear" if st.session_state["result"][2].is_clear() else "warning"
                     st.rerun()
 
@@ -894,12 +988,17 @@ with tab1:
             with col:
                 if st.button(label, key=f"demo_{key}", use_container_width=True):
                     p, o = SCENARIOS[key]()
-                    st.session_state["result"] = _run_check(p, o, 5.0)
+                    st.session_state["result"] = _run_check(
+                        p,
+                        o,
+                        5.0,
+                        include_near_misses=include_near_misses,
+                    )
                     st.session_state["pending_sound"] = "clear" if st.session_state["result"][2].is_clear() else "conflict"
                     st.rerun()
     else:
         primary, others, report, buffer_val, resolver_result = result
-        real_conflicts = [c for c in report.conflicts if c.severity != "near_miss"]
+        real_conflicts = [c for c in report.conflicts if c.severity in REAL_CONFLICT_SEVERITIES]
         near_misses = [c for c in report.conflicts if c.severity == "near_miss"]
 
         with st.container():
@@ -937,7 +1036,7 @@ with tab1:
                     "Collision-only",
                     key="quick_filter_collision",
                     use_container_width=True,
-                    disabled=not any(c.severity in ("collision", "buffer_breach") for c in report.conflicts),
+                    disabled=not any(c.severity in REAL_CONFLICT_SEVERITIES for c in report.conflicts),
                 ):
                     st.session_state["conflict_filter"] = "Collision/Buffer Breach"
                     st.rerun()
@@ -972,50 +1071,147 @@ with tab1:
             r1, r2, r3 = st.columns([1, 1, 1])
             replay_step = r1.number_input("Step (s)", min_value=0.1, max_value=2.0, value=0.2, step=0.1)
             replay_speed = r2.number_input("Speed (x)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
-            replay_start = r3.button("Play", use_container_width=True)
+            
+            # Use a key-based state to track replay button press
+            replay_start = r3.button("Play", use_container_width=True, key="replay_play_button")
 
             if replay_start:
+                st.info("Replay starting... Watch the airspace below.", icon="▶")
                 t_start_all = min([primary.departure_time] + [d.departure_time for d in others])
                 t_end_all = max([primary.arrival_time] + [d.arrival_time for d in others])
-                replay_placeholder = st.empty()
-                audio_armed = True
-                t_now = float(t_start_all)
-                while t_now <= float(t_end_all) + 1e-9:
-                    replay_placeholder.plotly_chart(
-                        _build_plotly_map(primary, others, report, buffer_val, t_now),
-                        use_container_width=True,
-                        config={"displayModeBar": False},
+                timeline, effective_step = _build_replay_timeline(
+                    float(t_start_all),
+                    float(t_end_all),
+                    float(replay_step),
+                    replay_max_frames,
+                )
+                if effective_step > replay_step + 1e-9:
+                    st.caption(
+                        f"Replay step auto-adjusted from {replay_step:.2f}s to {effective_step:.2f}s "
+                        f"for smoother performance."
                     )
-                    live_now = _is_conflict_live(report, t_now)
-                    if enable_audio and live_now and audio_armed:
-                        _play_sound("conflict")
-                        audio_armed = False
-                    if not live_now:
-                        audio_armed = True
-                    time.sleep(max(0.02, replay_step / max(replay_speed, 0.1)))
-                    t_now = round(t_now + replay_step, 6)
+
+                replay_placeholder = st.empty()
+                progress_bar = st.progress(0.0, text="Replaying mission...")
+                conflict_times = sorted(
+                    {float(c.time_of_conflict) for c in real_conflicts if c.severity in REAL_CONFLICT_SEVERITIES}
+                )
+                next_conflict_idx = 0
+
+                for frame_idx, t_now in enumerate(timeline):
+                    progress = frame_idx / max(len(timeline) - 1, 1)
+                    progress_bar.progress(min(max(progress, 0.0), 1.0), text=f"Time: {t_now:.2f}s / {t_end_all:.2f}s")
+
+                    with replay_placeholder.container():
+                        fig_replay = _build_plotly_map(primary, others, report, buffer_val, t_now)
+                        fig_replay.update_layout(
+                            height=550,
+                            margin=dict(l=50, r=20, t=50, b=40),
+                            title=dict(text=f"Airspace View — T = {t_now:.2f}s", font=dict(size=14, color="#e6edf3"))
+                        )
+                        st.plotly_chart(
+                            fig_replay,
+                            use_container_width=True,
+                            config={"displayModeBar": False, "responsive": True},
+                        )
+
+                    if enable_audio and conflict_times:
+                        previous_t = timeline[frame_idx - 1] if frame_idx > 0 else timeline[0]
+                        triggered, next_conflict_idx = _should_trigger_conflict_audio(
+                            conflict_times,
+                            previous_t,
+                            t_now,
+                            next_conflict_idx,
+                        )
+                        if triggered:
+                            _play_sound("conflict")
+
+                    if frame_idx < len(timeline) - 1:
+                        sleep_time = max(0.02, (effective_step / max(replay_speed, 0.1)))
+                        time.sleep(sleep_time)
+
+                progress_bar.empty()
+                st.success("✅ Replay completed!")
+
 
             if mode == "Advanced":
-                st.plotly_chart(_build_time_series(primary, others, buffer_val), use_container_width=True)
-                show_3d_legend = st.toggle(
-                    "Show 3D legend",
-                    value=True,
-                    key="show_3d_legend",
-                    help="Toggle legend visibility for the 3D airspace panel.",
+                # Advanced Mode: Show time-series and 3D visualizations
+                st.markdown("---")
+                st.markdown("#### Advanced Analytics")
+                
+                # Time-series separation graph
+                st.markdown("**Separation Over Time**")
+                try:
+                    time_series_fig = _build_time_series(
+                        primary,
+                        others,
+                        buffer_val,
+                        sample_points=time_series_samples,
+                    )
+                    time_series_fig.update_layout(
+                        height=380,
+                        margin=dict(l=60, r=20, t=40, b=50),
+                    )
+                    st.plotly_chart(
+                        time_series_fig,
+                        use_container_width=True,
+                        config={"displayModeBar": True, "responsive": True},
+                    )
+                except Exception as e:
+                    st.error(f"Error rendering time-series graph: {str(e)}")
+                
+                # 3D Airspace visualization
+                st.markdown("**3D Airspace Visualization**")
+                show_3d_panel = st.toggle(
+                    "Show 3D chart (heavier)",
+                    value=show_3d_default,
+                    key="show_3d_panel",
+                    help="Turn off for faster analysis in low-power systems.",
                 )
-                fig3d = build_3d_plotly(primary, others, report, buffer_val)
-                fig3d.update_layout(showlegend=show_3d_legend)
-                st.plotly_chart(fig3d, use_container_width=True)
+                if show_3d_panel:
+                    show_3d_legend = st.toggle(
+                        "Show 3D legend",
+                        value=True,
+                        key="show_3d_legend",
+                        help="Toggle legend visibility for the 3D airspace panel.",
+                    )
+                    try:
+                        fig3d = build_3d_plotly(primary, others, report, buffer_val)
+                        fig3d.update_layout(
+                            height=500,
+                            margin=dict(l=50, r=20, t=50, b=40),
+                            showlegend=show_3d_legend
+                        )
+                        st.plotly_chart(
+                            fig3d,
+                            use_container_width=True,
+                            config={"displayModeBar": True, "responsive": True},
+                        )
+                    except Exception as e:
+                        st.error(f"Error rendering 3D visualization: {str(e)}")
+                else:
+                    st.caption("3D chart is hidden in this run to keep the app responsive.")
 
             if resolver_result and resolver_result.get("resolved"):
                 st.markdown("#### Resolved Mission Preview")
-                resolved_primary = _shifted_mission(primary, float(resolver_result["offset"]))
-                resolved_report = check_mission(resolved_primary, others, buffer_val)
-                st.plotly_chart(
-                    _build_plotly_map(resolved_primary, others, resolved_report, buffer_val),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                )
+                try:
+                    resolved_primary = _shifted_mission(primary, float(resolver_result["offset"]))
+                    resolved_report = check_mission(resolved_primary, others, buffer_val)
+                    resolved_fig = _build_plotly_map(resolved_primary, others, resolved_report, buffer_val)
+                    resolved_fig.update_layout(
+                        height=450,
+                        margin=dict(l=50, r=20, t=50, b=40),
+                        title=dict(text=f"Airspace View (Resolved — Delay {resolver_result['offset']:.1f}s)", 
+                                 font=dict(size=14, color="#3fb950"))
+                    )
+                    st.plotly_chart(
+                        resolved_fig,
+                        use_container_width=True,
+                        config={"displayModeBar": True, "responsive": True},
+                    )
+                    st.success(f"✅ Resolved trajectory is CLEAR with {resolver_result['offset']:.1f}s departure delay")
+                except Exception as e:
+                    st.error(f"Error rendering resolved preview: {str(e)}")
 
         with right_col:
             st.markdown("#### Mission Summary")
@@ -1048,7 +1244,12 @@ with tab1:
             )
             if delay_what_if > 0:
                 shifted = _shifted_mission(primary, delay_what_if)
-                wi_report = check_mission(shifted, others, buffer_val)
+                wi_report = check_mission(
+                    shifted,
+                    others,
+                    buffer_val,
+                    include_near_misses=include_near_misses,
+                )
                 if wi_report.is_clear():
                     st.success(f"✅ Delay of {delay_what_if:.1f}s clears all conflicts!")
                 else:
@@ -1119,77 +1320,87 @@ with tab1:
                         st.warning(resolver_result.get("reason", "No clear slot found within search range."))
 
             st.markdown("---")
-            report_text = _export_text_report(primary, others, report, buffer_val, resolver_result)
-            st.download_button(
-                "Export Report (.txt)",
-                report_text,
-                file_name=f"deconfliction_report_{primary.drone_id}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
-
-            export_fig = _build_plotly_map(primary, others, report, buffer_val)
-            map_png_bytes, map_export_error = _build_map_png_bytes(export_fig)
-            if map_png_bytes:
+            with st.expander("Export Reports and Scenario", expanded=False):
+                report_text = _export_text_report(primary, others, report, buffer_val, resolver_result)
                 st.download_button(
-                    "Export Map Snapshot (.png)",
-                    map_png_bytes,
-                    file_name=f"map_snapshot_{primary.drone_id}.png",
-                    mime="image/png",
+                    "Export Report (.txt)",
+                    report_text,
+                    file_name=f"deconfliction_report_{primary.drone_id}.txt",
+                    mime="text/plain",
                     use_container_width=True,
                 )
-            elif map_export_error:
-                st.caption(map_export_error)
 
-            pdf_bytes, pdf_error = _build_pdf_report_bytes(
-                primary,
-                others,
-                report,
-                buffer_val,
-                resolver_result,
-                map_png_bytes=map_png_bytes,
-            )
-            if pdf_bytes:
-                st.download_button(
-                    "Export Report (.pdf)",
-                    pdf_bytes,
-                    file_name=f"deconfliction_report_{primary.drone_id}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
+                include_map_exports = st.toggle(
+                    "Prepare map image exports (slower)",
+                    value=False,
+                    key="enable_map_exports",
+                    help="Enable only when you need PNG/PDF map output.",
                 )
-            elif pdf_error:
-                st.caption(pdf_error)
 
-            scenario_json = json.dumps(
-                {
-                    "primary": {
-                        "drone_id": primary.drone_id,
-                        "waypoints": [[w.x, w.y, w.z] for w in primary.waypoints],
-                        "speed": primary.speed,
-                        "departure_time": primary.departure_time,
-                        "mission_end_time": primary.mission_end_time,
+                map_png_bytes: Optional[bytes] = None
+                if include_map_exports:
+                    export_fig = _build_plotly_map(primary, others, report, buffer_val)
+                    map_png_bytes, map_export_error = _build_map_png_bytes(export_fig)
+                    if map_png_bytes:
+                        st.download_button(
+                            "Export Map Snapshot (.png)",
+                            map_png_bytes,
+                            file_name=f"map_snapshot_{primary.drone_id}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                        )
+                    elif map_export_error:
+                        st.caption(map_export_error)
+
+                pdf_bytes, pdf_error = _build_pdf_report_bytes(
+                    primary,
+                    others,
+                    report,
+                    buffer_val,
+                    resolver_result,
+                    map_png_bytes=map_png_bytes if include_map_exports else None,
+                )
+                if pdf_bytes:
+                    st.download_button(
+                        "Export Report (.pdf)",
+                        pdf_bytes,
+                        file_name=f"deconfliction_report_{primary.drone_id}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                elif pdf_error:
+                    st.caption(pdf_error)
+
+                scenario_json = json.dumps(
+                    {
+                        "primary": {
+                            "drone_id": primary.drone_id,
+                            "waypoints": [[w.x, w.y, w.z] for w in primary.waypoints],
+                            "speed": primary.speed,
+                            "departure_time": primary.departure_time,
+                            "mission_end_time": primary.mission_end_time,
+                        },
+                        "others": [
+                            {
+                                "drone_id": d.drone_id,
+                                "waypoints": [[w.x, w.y, w.z] for w in d.waypoints],
+                                "speed": d.speed,
+                                "departure_time": d.departure_time,
+                                "mission_end_time": d.mission_end_time,
+                            }
+                            for d in others
+                        ],
+                        "safety_buffer": buffer_val,
                     },
-                    "others": [
-                        {
-                            "drone_id": d.drone_id,
-                            "waypoints": [[w.x, w.y, w.z] for w in d.waypoints],
-                            "speed": d.speed,
-                            "departure_time": d.departure_time,
-                            "mission_end_time": d.mission_end_time,
-                        }
-                        for d in others
-                    ],
-                    "safety_buffer": buffer_val,
-                },
-                indent=2,
-            )
-            st.download_button(
-                "Export Scenario (.json)",
-                scenario_json,
-                file_name=f"scenario_{primary.drone_id}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+                    indent=2,
+                )
+                st.download_button(
+                    "Export Scenario (.json)",
+                    scenario_json,
+                    file_name=f"scenario_{primary.drone_id}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
 
         if mode == "Advanced" and report.conflicts:
             st.markdown("---")
@@ -1340,7 +1551,12 @@ with tab2:
                 departure_time=float(custom_dep),
                 mission_end_time=float(custom_end),
             )
-            st.session_state["result"] = _run_check(custom_primary, traffic_others, builder_buffer)
+            st.session_state["result"] = _run_check(
+                custom_primary,
+                traffic_others,
+                builder_buffer,
+                include_near_misses=include_near_misses,
+            )
             report = st.session_state["result"][2]
             st.session_state["pending_sound"] = "clear" if report.is_clear() else "conflict"
             st.success("Mission evaluated. Open Scenario Explorer tab to inspect full results.")
